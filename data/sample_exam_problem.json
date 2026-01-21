@@ -1,0 +1,50 @@
+{
+  "days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+  "slots_per_day": 3,
+  "groups": [
+    {"group_id": "CSE-6A", "name": "CSE 6th Sem A", "size": 55},
+    {"group_id": "CSE-6B", "name": "CSE 6th Sem B", "size": 52}
+  ],
+  "rooms": [
+    {"room_id": "R101", "capacity": 60, "room_type": "Classroom"},
+    {"room_id": "R102", "capacity": 60, "room_type": "Classroom"},
+    {"room_id": "SeminarHall", "capacity": 120, "room_type": "Hall"}
+  ],
+  "exams": [
+    {
+      "exam_id": "EX-01",
+      "subject_code": "CSE601",
+      "subject_name": "AI",
+      "group_ids": ["CSE-6A", "CSE-6B"],
+      "duration_slots": 1
+    },
+    {
+      "exam_id": "EX-02",
+      "subject_code": "CSE602",
+      "subject_name": "DBMS",
+      "group_ids": ["CSE-6A"],
+      "duration_slots": 1
+    },
+    {
+      "exam_id": "EX-03",
+      "subject_code": "CSE603",
+      "subject_name": "CN",
+      "group_ids": ["CSE-6B"],
+      "duration_slots": 1
+    },
+    {
+      "exam_id": "EX-04",
+      "subject_code": "CSE604",
+      "subject_name": "SE",
+      "group_ids": ["CSE-6A", "CSE-6B"],
+      "duration_slots": 1
+    },
+    {
+      "exam_id": "EX-05",
+      "subject_code": "CSE605",
+      "subject_name": "ML",
+      "group_ids": ["CSE-6A"],
+      "duration_slots": 1
+    }
+  ]
+}

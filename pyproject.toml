@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "timetable-scheduler"
+version = "0.1.0"
+description = "Quantum-Inspired AI System for Academic Timetable Generation and Staff Allocation"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["optimizer", "modules", "utils", "ui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
