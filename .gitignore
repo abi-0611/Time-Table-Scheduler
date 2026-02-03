@@ -28,3 +28,14 @@ ui/database/*.db
 ui/database/*.db-journal
 ui/database/*.db-wal
 ui/database/*.db-shm
+
+# Local/reference spreadsheets (do not commit)
+Reference Data/
+*.xlsx
+*.xls
+
+# Generated analysis/docs outputs
+docs/reference_spreadsheet_analysis.md
+
+# Generated exports
+outputs/

@@ -68,10 +68,29 @@ def main() -> None:
                 max_value=4,
                 value=int((initial.get("academic_year", 3) if initial else 3)),
             )
-            section = c3.text_input(
-                "Section",
+            semester = c3.number_input(
+                "Semester (I–VIII)",
+                min_value=1,
+                max_value=8,
+                value=int((initial.get("semester", 5) if initial and initial.get("semester") is not None else 5)),
+                help="Matches sheets like 'III SEM (1)' and labels like 'SEMESTER : III - AI&DS-1'.",
+            )
+
+            c_prog, c_dept, c_sec = st.columns([1, 1, 1])
+            programme = c_prog.text_input(
+                "Programme",
+                value=str((initial.get("programme") if initial else "B.Tech.")) or "B.Tech.",
+                help="Shown in class timetable header as PROGRAMME : B.Tech.",
+            )
+            department = c_dept.text_input(
+                "Department",
+                value=str((initial.get("department") if initial else "AI&DS")) or "AI&DS",
+            )
+            section = c_sec.text_input(
+                "Section identifier",
                 value=str((initial.get("section") if initial else "")),
-                placeholder="A",
+                placeholder="AI&DS-1 / AI&DS-2 / A / B",
+                help="Use spreadsheet-style identifiers (e.g., AI&DS-1, AI&DS-2).",
             )
 
             c4, c5 = st.columns([1, 2])
@@ -86,6 +105,30 @@ def main() -> None:
                 options=subject_codes,
                 # list_student_groups() exposes enrolled subjects under key 'subjects'
                 default=list((initial.get("subjects") if initial else []) or []),
+            )
+
+            st.divider()
+            st.subheader("Timetable header metadata (optional)")
+            c_hall, c_eff = st.columns(2)
+            hall_no = c_hall.text_input(
+                "Hall No (optional)",
+                value=str((initial.get("hall_no") if initial else "")),
+                help="Seen in class timetable header as Hall No : A202 / A203.",
+            )
+            eff_date = c_eff.date_input(
+                "With effect from (optional)",
+                value=None,
+                help="Seen in spreadsheet header as 'With Effect From : dd.mm.yyyy'.",
+            )
+
+            c_adv1, c_adv2 = st.columns(2)
+            class_advisor = c_adv1.text_input(
+                "Class advisor (optional)",
+                value=str((initial.get("class_advisor") if initial else "")),
+            )
+            co_advisor = c_adv2.text_input(
+                "Co-advisor (optional)",
+                value=str((initial.get("co_advisor") if initial else "")),
             )
 
             submitted = st.form_submit_button("Save Student Group")
@@ -104,10 +147,17 @@ def main() -> None:
                 crud.upsert_student_group(
                     conn,
                     group_id=group_id.strip(),
+                    programme=programme.strip() or "B.Tech.",
+                    department=department.strip() or "AI&DS",
+                    semester=int(semester),
                     academic_year=int(academic_year),
                     section=section.strip() or "A",
                     size=int(size),
                     subject_codes=enrolled,
+                    hall_no=hall_no.strip() or None,
+                    class_advisor=class_advisor.strip() or None,
+                    co_advisor=co_advisor.strip() or None,
+                    effective_from=eff_date.isoformat() if eff_date else None,
                 )
                 st.session_state["group_id"] = generate_group_id(conn)
 

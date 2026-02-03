@@ -54,6 +54,10 @@ class Faculty:
     # availability: {"Mon": {1,2,3}, ...}  (1-indexed slots)
     availability: Dict[str, set[int]]
 
+    # Optional metadata for spreadsheet-style reports.
+    designation: Optional[str] = None
+    max_daily_workload_hours: Optional[int] = None
+
 
 @dataclass(frozen=True)
 class Subject:
@@ -67,6 +71,13 @@ class Subject:
     allow_wrap_split: bool = False
     time_preference: str = "Any"  # Any | Early | Middle | Late
 
+    # Optional metadata for workload reporting and spreadsheet alignment.
+    department: str = ""
+    subject_type: str = "Theory"  # Theory/Lab/Tutorial/Project/Library/Mentoring/Other
+    l_hours: int = 0
+    t_hours: int = 0
+    p_hours: int = 0
+
 
 @dataclass(frozen=True)
 class StudentGroup:
@@ -74,6 +85,17 @@ class StudentGroup:
     academic_year: int
     section: str
     size: int
+
+    # Optional metadata for headers and department-wise summaries.
+    department: str = ""
+    semester: Optional[int] = None
+
+    # Optional spreadsheet header metadata.
+    programme: str = ""
+    hall_no: Optional[str] = None
+    class_advisor: Optional[str] = None
+    co_advisor: Optional[str] = None
+    effective_from: Optional[str] = None  # ISO date string
 
 
 @dataclass(frozen=True)
@@ -118,11 +140,37 @@ class ClassSession:
     session_id: str
     group_id: str
     subject_code: str
+
+    # Optional subgroup/batch within a student group (e.g., "A", "B").
+    # If None, the session applies to the whole group and conflicts with any subgroup session.
+    subgroup_id: Optional[str] = None
+
+    # Optional key that forces multiple sessions to run in parallel (same day+start slot).
+    # Used to model spreadsheet cells like "X / Y" (parallel batches).
+    parallel_key: Optional[str] = None
+
     duration_slots: int = 1
     allow_split: bool = False
     split_pattern: str = "consecutive"
     allow_wrap_split: bool = False
     time_preference: str = "Any"
+
+
+@dataclass(frozen=True)
+class GroupSubjectSettings:
+    """Per (group, subject) delivery settings.
+
+    - batches: number of subgroups used for this offering (1 = whole group).
+    - batch_set: which subgroup labels are active for this offering.
+        - empty/None means "all batches" (A..)
+        - e.g. ("A",) means only batch A attends (useful for electives)
+    - parallel_group: if set, offerings with the same (group_id, parallel_group) will be
+      generated with a shared parallel_key per occurrence index so they align in time.
+    """
+
+    batches: int = 1
+    batch_set: Tuple[str, ...] = ()
+    parallel_group: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +182,9 @@ class ClassProblem:
     group_subjects: Dict[str, Tuple[str, ...]]  # group_id -> subject codes
     faculty_subjects: Dict[str, Tuple[str, ...]]  # faculty_id -> subject codes
     sessions: Dict[str, ClassSession]
+
+    # Optional per-offering settings (backward compatible; missing => defaults).
+    group_subject_settings: Dict[Tuple[str, str], GroupSubjectSettings] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -324,6 +375,26 @@ def _occupied_slots_for_assignment(
     return out
 
 
+def occupied_slots_for_assignment(
+    problem: ClassProblem,
+    session: ClassSession,
+    assignment: SessionAssignment,
+    *,
+    prefer_main_break_block_mode: str = "any",
+) -> Optional[List[Tuple[int, int]]]:
+    """Public wrapper for occupied slots.
+
+    Returns occupied (day_idx, slot1) pairs, accounting for splits and wraps.
+    """
+
+    return _occupied_slots_for_assignment(
+        problem,
+        session,
+        assignment,
+        prefer_main_break_block_mode=str(prefer_main_break_block_mode or "any"),
+    )
+
+
 def _faculty_availability_map(raw_list: List[dict]) -> Dict[str, set[int]]:
     # Stored by UI as: [{"day": "Mon", "slots": [1,2]}]
     out: Dict[str, set[int]] = {}
@@ -340,6 +411,20 @@ def _faculty_availability_map(raw_list: List[dict]) -> Dict[str, set[int]]:
 # ----------------------------
 
 
+_BATCH_LABELS: Tuple[str, ...] = ("A", "B", "C", "D")
+
+
+def _active_batches(*, batches: int, batch_set: Optional[Tuple[str, ...]]) -> Tuple[str, ...]:
+    n = max(1, int(batches or 1))
+    labels = _BATCH_LABELS[: min(n, len(_BATCH_LABELS))]
+    chosen = tuple(str(x).strip().upper() for x in (batch_set or ()) if str(x).strip())
+    if not chosen:
+        return labels
+    # Filter to allowed labels only.
+    allowed = set(labels)
+    return tuple(x for x in chosen if x in allowed) or labels
+
+
 def build_sessions(problem: ClassProblem) -> Dict[str, ClassSession]:
     sessions: Dict[str, ClassSession] = {}
     i = 1
@@ -348,22 +433,43 @@ def build_sessions(problem: ClassProblem) -> Dict[str, ClassSession]:
             subj = problem.subjects.get(code)
             if subj is None:
                 continue
+
+            # Per (group, subject) delivery settings (optional).
+            gss_map = getattr(problem, "group_subject_settings", None) or {}
+            gss = gss_map.get((group_id, code), GroupSubjectSettings())
+            batches = max(1, int(getattr(gss, "batches", 1) or 1))
+            active_batches = _active_batches(batches=batches, batch_set=getattr(gss, "batch_set", ()) or ())
+            parallel_group = getattr(gss, "parallel_group", None)
+
             dur = max(1, int(getattr(subj, "session_duration", 1) or 1))
             # Number of sessions is weekly hours divided into blocks of `dur` slots (ceiling)
             count = int(math.ceil(int(subj.weekly_hours) / dur))
-            for _k in range(count):
-                sid = f"S{i:04d}"
-                sessions[sid] = ClassSession(
-                    session_id=sid,
-                    group_id=group_id,
-                    subject_code=code,
-                    duration_slots=dur,
-                    allow_split=bool(getattr(subj, "allow_split", False)),
-                    split_pattern=str(getattr(subj, "split_pattern", "consecutive") or "consecutive"),
-                    allow_wrap_split=bool(getattr(subj, "allow_wrap_split", False)),
-                    time_preference=str(getattr(subj, "time_preference", "Any") or "Any"),
-                )
-                i += 1
+
+            for occ_idx in range(count):
+                # If batches == 1, create a single whole-group session.
+                # If batches > 1, create one session per active batch (A/B/...).
+                batch_labels = (None,) if batches <= 1 else tuple(active_batches)
+
+                # Shared parallel key per occurrence (across subjects that share a parallel_group).
+                pkey = None
+                if parallel_group:
+                    pkey = f"{group_id}:{parallel_group}:{occ_idx}"
+
+                for b in batch_labels:
+                    sid = f"S{i:04d}"
+                    sessions[sid] = ClassSession(
+                        session_id=sid,
+                        group_id=group_id,
+                        subject_code=code,
+                        subgroup_id=b,
+                        parallel_key=pkey,
+                        duration_slots=dur,
+                        allow_split=bool(getattr(subj, "allow_split", False)),
+                        split_pattern=str(getattr(subj, "split_pattern", "consecutive") or "consecutive"),
+                        allow_wrap_split=bool(getattr(subj, "allow_wrap_split", False)),
+                        time_preference=str(getattr(subj, "time_preference", "Any") or "Any"),
+                    )
+                    i += 1
     return sessions
 
 
@@ -376,8 +482,13 @@ def compute_energy(problem: ClassProblem, settings: ClassSchedulingSettings, sta
     hard = 0.0
     soft = 0.0
 
-    # occupancy maps
-    group_occ: Dict[Tuple[str, Tuple[int, int]], int] = {}
+    # Group occupancy maps
+    # - subgroup sessions only conflict with the same subgroup_id
+    # - whole-group sessions (subgroup_id=None) conflict with ANY subgroup session
+    group_occ_sub: Dict[Tuple[str, str, Tuple[int, int]], int] = {}  # (group_id, subgroup_id, ts) -> count
+    group_occ_sub_total: Dict[Tuple[str, Tuple[int, int]], int] = {}  # (group_id, ts) -> count
+    group_occ_all: Dict[Tuple[str, Tuple[int, int]], int] = {}  # (group_id, ts) -> count
+    group_occ_total: Dict[Tuple[str, Tuple[int, int]], int] = {}  # (group_id, ts) -> count
     faculty_occ: Dict[Tuple[str, Tuple[int, int]], int] = {}
 
     # Track occupied slot numbers per (group_id, day_idx) for compactness penalty.
@@ -387,7 +498,8 @@ def compute_energy(problem: ClassProblem, settings: ClassSchedulingSettings, sta
     faculty_load: Dict[str, int] = {fid: 0 for fid in problem.faculty.keys()}
 
     # subject/day spread tracking
-    subj_day_count: Dict[Tuple[str, str, int], int] = {}  # (group_id, subject_code, day_idx) -> count
+    # We track distinct start slots to avoid double-counting parallel batches as "multiple occurrences".
+    subj_day_starts: Dict[Tuple[str, str, int], set[int]] = {}  # (group_id, subject_code, day_idx) -> {start_slot1,...}
 
     main_break_boundary = _main_break_boundary(problem)
     max_slot = int(problem.academic.slots_per_day)
@@ -399,6 +511,9 @@ def compute_energy(problem: ClassProblem, settings: ClassSchedulingSettings, sta
     faculty_allowed: Dict[str, set[str]] = {
         fid: set(problem.faculty_subjects.get(fid, ())) for fid in problem.faculty.keys()
     }
+
+    # Track parallel constraints: sessions with same parallel_key must share (day_idx, slot_idx) and duration.
+    parallel_ref: Dict[str, Tuple[int, int, int]] = {}  # key -> (day_idx, slot_idx, duration_slots)
 
     for sid, sess in problem.sessions.items():
         a = state.assignments[sid]
@@ -420,8 +535,17 @@ def compute_energy(problem: ClassProblem, settings: ClassSchedulingSettings, sta
         for (bd, t1) in occ:
             ts = _timeslot_key(bd, t1 - 1)
 
-            # group cannot overlap
-            group_occ[(sess.group_id, ts)] = group_occ.get((sess.group_id, ts), 0) + 1
+            # group occupancy
+            if getattr(sess, "subgroup_id", None) is None:
+                group_occ_all[(sess.group_id, ts)] = group_occ_all.get((sess.group_id, ts), 0) + 1
+            else:
+                sg = str(getattr(sess, "subgroup_id") or "").strip().upper()
+                if sg:
+                    key = (sess.group_id, sg, ts)
+                    group_occ_sub[key] = group_occ_sub.get(key, 0) + 1
+                    group_occ_sub_total[(sess.group_id, ts)] = group_occ_sub_total.get((sess.group_id, ts), 0) + 1
+
+            group_occ_total[(sess.group_id, ts)] = group_occ_total.get((sess.group_id, ts), 0) + 1
 
             # track occupied slots for compactness
             key_gd = (sess.group_id, bd)
@@ -499,23 +623,50 @@ def compute_energy(problem: ClassProblem, settings: ClassSchedulingSettings, sta
             soft += settings.prefer_time_of_day * outside
 
         # soft: spread same subject for same group
-        subj_day_count[(sess.group_id, sess.subject_code, a.day_idx)] = subj_day_count.get(
-            (sess.group_id, sess.subject_code, a.day_idx),
-            0,
-        ) + 1
+        k_sds = (sess.group_id, sess.subject_code, a.day_idx)
+        if k_sds not in subj_day_starts:
+            subj_day_starts[k_sds] = set()
+        subj_day_starts[k_sds].add(int(a.slot_idx) + 1)
+
+        # hard: parallel key alignment (X / Y)
+        pkey = getattr(sess, "parallel_key", None)
+        if pkey:
+            d = max(1, int(getattr(sess, "duration_slots", 1) or 1))
+            ref = parallel_ref.get(str(pkey))
+            if ref is None:
+                parallel_ref[str(pkey)] = (int(a.day_idx), int(a.slot_idx), d)
+            else:
+                if (int(a.day_idx), int(a.slot_idx)) != (ref[0], ref[1]):
+                    hard += settings.hard_penalty
+                if d != int(ref[2]):
+                    hard += settings.hard_penalty
 
     # hard constraint: overlaps
-    for _k, c in group_occ.items():
+    # - whole-group overlaps with whole-group
+    for _k, c in group_occ_all.items():
         if c > 1:
             hard += settings.hard_penalty * (c - 1)
+    # - same subgroup overlaps with itself
+    for _k, c in group_occ_sub.items():
+        if c > 1:
+            hard += settings.hard_penalty * (c - 1)
+    # - whole-group overlaps with any subgroup session in the same timeslot
+    for (gid, ts), c_all in group_occ_all.items():
+        if c_all <= 0:
+            continue
+        c_sub = group_occ_sub_total.get((gid, ts), 0)
+        if c_sub > 0:
+            hard += settings.hard_penalty * float(c_all * c_sub)
+
     for _k, c in faculty_occ.items():
         if c > 1:
             hard += settings.hard_penalty * (c - 1)
 
     # soft: penalize multiple occurrences of same subject on same day for a group
-    for (_gid, _scode, _day), c in subj_day_count.items():
+    for (_gid, _scode, _day), starts in subj_day_starts.items():
+        c = len(starts)
         if c > 1:
-            soft += settings.prefer_spread_subject_across_days * (c - 1)
+            soft += settings.prefer_spread_subject_across_days * float(c - 1)
 
     # soft: encourage a buffer around the main break boundary (avoid class immediately before/after)
     # Boundary b is between slot b and b+1.
@@ -525,10 +676,10 @@ def compute_energy(problem: ClassProblem, settings: ClassSchedulingSettings, sta
         for day_idx in range(len(problem.academic.days)):
             for gid in problem.groups.keys():
                 if 1 <= before <= max_slot:
-                    if group_occ.get((gid, _timeslot_key(day_idx, before - 1)), 0) > 0:
+                    if group_occ_total.get((gid, _timeslot_key(day_idx, before - 1)), 0) > 0:
                         soft += settings.prefer_keep_main_break_free
                 if 1 <= after <= max_slot:
-                    if group_occ.get((gid, _timeslot_key(day_idx, after - 1)), 0) > 0:
+                    if group_occ_total.get((gid, _timeslot_key(day_idx, after - 1)), 0) > 0:
                         soft += settings.prefer_keep_main_break_free
 
     # soft: compactness (minimize gaps inside each group's day)
@@ -553,7 +704,9 @@ def compute_metrics(problem: ClassProblem, settings: ClassSchedulingSettings, st
     group_conflicts = 0
     faculty_conflicts = 0
 
-    group_occ: Dict[Tuple[str, Tuple[int, int]], int] = {}
+    group_occ_sub: Dict[Tuple[str, str, Tuple[int, int]], int] = {}
+    group_occ_sub_total: Dict[Tuple[str, Tuple[int, int]], int] = {}
+    group_occ_all: Dict[Tuple[str, Tuple[int, int]], int] = {}
     faculty_occ: Dict[Tuple[str, Tuple[int, int]], int] = {}
 
     for sid, sess in problem.sessions.items():
@@ -568,12 +721,29 @@ def compute_metrics(problem: ClassProblem, settings: ClassSchedulingSettings, st
             continue
         for (bd, t1) in occ:
             ts = _timeslot_key(bd, t1 - 1)
-            group_occ[(sess.group_id, ts)] = group_occ.get((sess.group_id, ts), 0) + 1
+            if getattr(sess, "subgroup_id", None) is None:
+                group_occ_all[(sess.group_id, ts)] = group_occ_all.get((sess.group_id, ts), 0) + 1
+            else:
+                sg = str(getattr(sess, "subgroup_id") or "").strip().upper()
+                if sg:
+                    key = (sess.group_id, sg, ts)
+                    group_occ_sub[key] = group_occ_sub.get(key, 0) + 1
+                    group_occ_sub_total[(sess.group_id, ts)] = group_occ_sub_total.get((sess.group_id, ts), 0) + 1
             faculty_occ[(a.faculty_id, ts)] = faculty_occ.get((a.faculty_id, ts), 0) + 1
 
-    for _k, c in group_occ.items():
+    for _k, c in group_occ_all.items():
         if c > 1:
             group_conflicts += c - 1
+    for _k, c in group_occ_sub.items():
+        if c > 1:
+            group_conflicts += c - 1
+    for (gid, ts), c_all in group_occ_all.items():
+        if c_all <= 0:
+            continue
+        c_sub = group_occ_sub_total.get((gid, ts), 0)
+        if c_sub > 0:
+            group_conflicts += c_all * c_sub
+
     for _k, c in faculty_occ.items():
         if c > 1:
             faculty_conflicts += c - 1
@@ -646,6 +816,21 @@ def make_initial_state(problem: ClassProblem, settings: ClassSchedulingSettings,
             faculty_id=fid,
         )
 
+    # Initialize parallel groups to share the same (day,slot) to reduce hard violations at start.
+    parallel_members: Dict[str, List[str]] = {}
+    for sid, sess in problem.sessions.items():
+        pkey = getattr(sess, "parallel_key", None)
+        if pkey:
+            parallel_members.setdefault(str(pkey), []).append(sid)
+
+    for _pkey, sids in parallel_members.items():
+        if len(sids) <= 1:
+            continue
+        ref = assignments[sids[0]]
+        for sid in sids[1:]:
+            cur = assignments[sid]
+            assignments[sid] = SessionAssignment(day_idx=ref.day_idx, slot_idx=ref.slot_idx, faculty_id=cur.faculty_id)
+
     return ClassScheduleState(assignments=assignments)
 
 
@@ -664,6 +849,12 @@ def neighbor_move(problem: ClassProblem, settings: ClassSchedulingSettings):
             continue
         eligible_faculty_by_subject[scode] = [fid for fid in faculty_ids if scode in faculty_allowed.get(fid, set())]
 
+    parallel_members: Dict[str, List[str]] = {}
+    for sid, sess in problem.sessions.items():
+        pkey = getattr(sess, "parallel_key", None)
+        if pkey:
+            parallel_members.setdefault(str(pkey), []).append(sid)
+
     def neighbor(state: ClassScheduleState, rng: random.Random) -> ClassScheduleState:
         new_assign = dict(state.assignments)
 
@@ -672,12 +863,29 @@ def neighbor_move(problem: ClassProblem, settings: ClassSchedulingSettings):
         sess = problem.sessions[sid]
 
         r = rng.random()
+        move_parallel = False
+        pkey = getattr(sess, "parallel_key", None)
+        if pkey and rng.random() < 0.7:
+            move_parallel = True
+
         if r < 0.4:
-            new_assign[sid] = SessionAssignment(day_idx=rng.randrange(day_count), slot_idx=a.slot_idx, faculty_id=a.faculty_id)
+            new_day = rng.randrange(day_count)
+            if move_parallel:
+                for mid in parallel_members.get(str(pkey), [sid]):
+                    cur = new_assign[mid]
+                    new_assign[mid] = SessionAssignment(day_idx=new_day, slot_idx=cur.slot_idx, faculty_id=cur.faculty_id)
+            else:
+                new_assign[sid] = SessionAssignment(day_idx=new_day, slot_idx=a.slot_idx, faculty_id=a.faculty_id)
         elif r < 0.8:
-            new_assign[sid] = SessionAssignment(day_idx=a.day_idx, slot_idx=rng.randrange(slot_count), faculty_id=a.faculty_id)
+            new_slot = rng.randrange(slot_count)
+            if move_parallel:
+                for mid in parallel_members.get(str(pkey), [sid]):
+                    cur = new_assign[mid]
+                    new_assign[mid] = SessionAssignment(day_idx=cur.day_idx, slot_idx=new_slot, faculty_id=cur.faculty_id)
+            else:
+                new_assign[sid] = SessionAssignment(day_idx=a.day_idx, slot_idx=new_slot, faculty_id=a.faculty_id)
         else:
-            # change faculty (prefer eligible)
+            # change faculty (prefer eligible) for the chosen session only
             allowed = eligible_faculty_by_subject.get(sess.subject_code) or []
             if not allowed:
                 allowed = faculty_ids
@@ -705,7 +913,8 @@ def format_group_timetable(
     days = list(problem.academic.days)
     slots = int(problem.academic.slots_per_day)
 
-    table = [["" for _ in range(slots)] for _ in range(len(days))]
+    cell_labels: List[List[List[Tuple[str, str]]]] = [[[] for _ in range(slots)] for _ in range(len(days))]
+    cont: List[List[bool]] = [[False for _ in range(slots)] for _ in range(len(days))]
 
     for sid, sess in problem.sessions.items():
         if sess.group_id != group_id:
@@ -734,7 +943,22 @@ def format_group_timetable(
         for (bd, t1) in occ_same_group:
             col = int(t1) - 1
             if 0 <= bd < len(days) and 0 <= col < slots:
-                table[bd][col] = label if (bd, t1) == first else "▸"
+                if (bd, t1) == first:
+                    sg = str(getattr(sess, "subgroup_id", "") or "").strip().upper()
+                    cell_labels[bd][col].append((sg, label))
+                else:
+                    cont[bd][col] = True
+
+    table: List[List[str]] = [["" for _ in range(slots)] for _ in range(len(days))]
+    for r in range(len(days)):
+        for c in range(slots):
+            if cell_labels[r][c]:
+                parts = [p[1] for p in sorted(cell_labels[r][c], key=lambda x: (x[0] or "", x[1]))]
+                table[r][c] = " / ".join(parts)
+            elif cont[r][c]:
+                table[r][c] = "▸"
+            else:
+                table[r][c] = ""
 
     return table
 
@@ -749,7 +973,8 @@ def format_faculty_timetable(
     days = list(problem.academic.days)
     slots = int(problem.academic.slots_per_day)
 
-    table = [["" for _ in range(slots)] for _ in range(len(days))]
+    cell_labels: List[List[List[str]]] = [[[] for _ in range(slots)] for _ in range(len(days))]
+    cont: List[List[bool]] = [[False for _ in range(slots)] for _ in range(len(days))]
 
     for sid, sess in problem.sessions.items():
         a = state.assignments[sid]
@@ -774,7 +999,20 @@ def format_faculty_timetable(
         for (bd, t1) in occ_same_fac:
             col = int(t1) - 1
             if 0 <= bd < len(days) and 0 <= col < slots:
-                table[bd][col] = label if (bd, t1) == first else "▸"
+                if (bd, t1) == first:
+                    cell_labels[bd][col].append(label)
+                else:
+                    cont[bd][col] = True
+
+    table: List[List[str]] = [["" for _ in range(slots)] for _ in range(len(days))]
+    for r in range(len(days)):
+        for c in range(slots):
+            if cell_labels[r][c]:
+                table[r][c] = " / ".join(sorted(cell_labels[r][c]))
+            elif cont[r][c]:
+                table[r][c] = "▸"
+            else:
+                table[r][c] = ""
 
     return table
 

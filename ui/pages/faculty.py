@@ -107,14 +107,34 @@ def main() -> None:
                 value=str((initial.get("department") if initial else "CSE")),
             )
 
-            c4, c5 = st.columns(2)
+            c_des, c_lab = st.columns([2, 1])
+            designation = c_des.text_input(
+                "Designation (optional)",
+                value=str((initial.get("designation") if initial else "")),
+                help="Seen in individual timetable (e.g., Associate Professor, Professor & Head).",
+            )
+            lab_capable = c_lab.checkbox(
+                "Can handle labs",
+                value=bool(int((initial.get("lab_capable", 1) if initial else 1))),
+                help="Used for staffing practicals (optional input; stored even if not enforced yet).",
+            )
+
+            c4, c5, c6 = st.columns(3)
             max_workload = c4.number_input(
                 "Max workload (hours/week)",
                 min_value=1,
                 max_value=40,
                 value=int((initial.get("max_workload_hours", 16) if initial else 16)),
+                help="Matches staff workload sheets that sum Total Hrs/Week.",
             )
-            handled_subjects = c5.multiselect(
+            max_daily = c5.number_input(
+                "Max daily teaching hours (optional)",
+                min_value=0,
+                max_value=12,
+                value=int((initial.get("max_daily_workload_hours", 0) if initial and initial.get("max_daily_workload_hours") is not None else 0)),
+                help="Policy input (not always present in spreadsheets). Set 0 to leave unset.",
+            )
+            handled_subjects = c6.multiselect(
                 "Subjects handled",
                 options=subject_codes,
                 default=list((initial.get("subject_codes") if initial else []) or []),
@@ -146,13 +166,24 @@ def main() -> None:
                 st.error(msg)
                 st.stop()
 
+            max_daily_val = None
+            if int(max_daily) > 0:
+                ok, msg = validate_positive_int(int(max_daily), "Max daily teaching hours", 1, 12)
+                if not ok:
+                    st.error(msg)
+                    st.stop()
+                max_daily_val = int(max_daily)
+
             with db_session() as conn:
                 crud.upsert_faculty(
                     conn,
                     faculty_id=faculty_id.strip(),
                     name=name.strip(),
                     department=department.strip(),
+                    designation=designation.strip() or None,
                     max_workload_hours=int(max_workload),
+                    max_daily_workload_hours=max_daily_val,
+                    lab_capable=1 if lab_capable else 0,
                     availability=availability,
                     subject_codes=handled_subjects,
                 )

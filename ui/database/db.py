@@ -84,6 +84,17 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS subjects (
             subject_code TEXT PRIMARY KEY,
             subject_name TEXT NOT NULL,
+            department TEXT NOT NULL DEFAULT 'AI&DS',
+            semester INTEGER CHECK (semester BETWEEN 1 AND 8),
+            subject_type TEXT NOT NULL DEFAULT 'Theory' CHECK (subject_type IN ('Theory','Lab','Tutorial','Project','Library','Mentoring','Other')),
+            l_hours INTEGER NOT NULL DEFAULT 0 CHECK (l_hours BETWEEN 0 AND 20),
+            t_hours INTEGER NOT NULL DEFAULT 0 CHECK (t_hours BETWEEN 0 AND 20),
+            p_hours INTEGER NOT NULL DEFAULT 0 CHECK (p_hours BETWEEN 0 AND 20),
+            lab_block_size INTEGER CHECK (lab_block_size BETWEEN 1 AND 8),
+            importance_weight REAL NOT NULL DEFAULT 1.0 CHECK (importance_weight BETWEEN 0.1 AND 10.0),
+            difficulty_group_id TEXT NOT NULL DEFAULT 'General',
+            is_elective INTEGER NOT NULL DEFAULT 0 CHECK (is_elective IN (0,1)),
+            elective_group_id TEXT,
             academic_year INTEGER NOT NULL CHECK (academic_year BETWEEN 1 AND 4),
             weekly_hours INTEGER NOT NULL CHECK (weekly_hours BETWEEN 1 AND 20),
             session_duration INTEGER NOT NULL DEFAULT 1 CHECK (session_duration BETWEEN 1 AND 6),
@@ -101,7 +112,10 @@ def init_db(conn: sqlite3.Connection) -> None:
             faculty_id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             department TEXT NOT NULL,
+            designation TEXT,
             max_workload_hours INTEGER NOT NULL CHECK (max_workload_hours BETWEEN 1 AND 40),
+            max_daily_workload_hours INTEGER CHECK (max_daily_workload_hours BETWEEN 1 AND 12),
+            lab_capable INTEGER NOT NULL DEFAULT 1 CHECK (lab_capable IN (0,1)),
             availability_json TEXT NOT NULL DEFAULT '[]'
         );
 
@@ -116,8 +130,15 @@ def init_db(conn: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS student_groups (
             group_id TEXT PRIMARY KEY,
+            programme TEXT NOT NULL DEFAULT 'B.Tech.',
+            department TEXT NOT NULL DEFAULT 'AI&DS',
+            semester INTEGER CHECK (semester BETWEEN 1 AND 8),
             academic_year INTEGER NOT NULL CHECK (academic_year BETWEEN 1 AND 4),
             section TEXT NOT NULL,
+            hall_no TEXT,
+            class_advisor TEXT,
+            co_advisor TEXT,
+            effective_from TEXT,
             size INTEGER NOT NULL CHECK (size > 0)
         );
 
@@ -129,6 +150,58 @@ def init_db(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (group_id) REFERENCES student_groups(group_id) ON DELETE CASCADE,
             FOREIGN KEY (subject_code) REFERENCES subjects(subject_code) ON DELETE CASCADE
         );
+
+        -- Optional per (group, subject) delivery settings.
+        -- Used for batch-split practicals and enforced parallelism ("X / Y" cells).
+        CREATE TABLE IF NOT EXISTS group_subject_settings (
+            group_id TEXT NOT NULL,
+            subject_code TEXT NOT NULL,
+            batches INTEGER NOT NULL DEFAULT 1 CHECK (batches BETWEEN 1 AND 4),
+            batch_set_json TEXT NOT NULL DEFAULT '[]',
+            parallel_group TEXT,
+            relation_type TEXT NOT NULL DEFAULT 'PARALLEL_BATCH' CHECK (relation_type IN ('PARALLEL_BATCH','ELECTIVE_CHOICE')),
+            staff_per_batch INTEGER NOT NULL DEFAULT 1 CHECK (staff_per_batch BETWEEN 1 AND 5),
+            periods_per_week_override INTEGER CHECK (periods_per_week_override BETWEEN 1 AND 20),
+            PRIMARY KEY (group_id, subject_code),
+            FOREIGN KEY (group_id) REFERENCES student_groups(group_id) ON DELETE CASCADE,
+            FOREIGN KEY (subject_code) REFERENCES subjects(subject_code) ON DELETE CASCADE
+        );
+
+        -- Elective group definitions (Professional/Open/Management electives etc.)
+        CREATE TABLE IF NOT EXISTS elective_groups (
+            elective_group_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'Professional' CHECK (kind IN ('Professional','Open','Management','Mandatory','Other')),
+            department TEXT,
+            semester INTEGER CHECK (semester BETWEEN 1 AND 8),
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS elective_group_subjects (
+            elective_group_id TEXT NOT NULL,
+            subject_code TEXT NOT NULL,
+            PRIMARY KEY (elective_group_id, subject_code),
+            FOREIGN KEY (elective_group_id) REFERENCES elective_groups(elective_group_id) ON DELETE CASCADE,
+            FOREIGN KEY (subject_code) REFERENCES subjects(subject_code) ON DELETE CASCADE
+        );
+
+        -- Optional schedule locks for incremental scheduling (weekly class).
+        CREATE TABLE IF NOT EXISTS weekly_class_locks (
+            lock_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL,
+            day TEXT NOT NULL,
+            slot INTEGER NOT NULL,
+            subject_code TEXT,
+            faculty_id TEXT,
+            subgroup_id TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (group_id) REFERENCES student_groups(group_id) ON DELETE CASCADE,
+            FOREIGN KEY (subject_code) REFERENCES subjects(subject_code) ON DELETE SET NULL,
+            FOREIGN KEY (faculty_id) REFERENCES faculty(faculty_id) ON DELETE SET NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_weekly_class_locks_unique
+        ON weekly_class_locks(group_id, day, slot, subgroup_id);
 
         -- -----------------------------
         -- Generated schedules (saved)
@@ -224,6 +297,28 @@ def init_db(conn: sqlite3.Connection) -> None:
     # --- Lightweight migrations (SQLite)
     # If an older DB exists, it may be missing newly added columns.
     subj_cols = {r[1] for r in conn.execute("PRAGMA table_info(subjects)").fetchall()}
+    if "department" not in subj_cols:
+        conn.execute("ALTER TABLE subjects ADD COLUMN department TEXT NOT NULL DEFAULT 'AI&DS'")
+    if "semester" not in subj_cols:
+        conn.execute("ALTER TABLE subjects ADD COLUMN semester INTEGER")
+    if "subject_type" not in subj_cols:
+        conn.execute("ALTER TABLE subjects ADD COLUMN subject_type TEXT NOT NULL DEFAULT 'Theory'")
+    if "l_hours" not in subj_cols:
+        conn.execute("ALTER TABLE subjects ADD COLUMN l_hours INTEGER NOT NULL DEFAULT 0")
+    if "t_hours" not in subj_cols:
+        conn.execute("ALTER TABLE subjects ADD COLUMN t_hours INTEGER NOT NULL DEFAULT 0")
+    if "p_hours" not in subj_cols:
+        conn.execute("ALTER TABLE subjects ADD COLUMN p_hours INTEGER NOT NULL DEFAULT 0")
+    if "lab_block_size" not in subj_cols:
+        conn.execute("ALTER TABLE subjects ADD COLUMN lab_block_size INTEGER")
+    if "importance_weight" not in subj_cols:
+        conn.execute("ALTER TABLE subjects ADD COLUMN importance_weight REAL NOT NULL DEFAULT 1.0")
+    if "difficulty_group_id" not in subj_cols:
+        conn.execute("ALTER TABLE subjects ADD COLUMN difficulty_group_id TEXT NOT NULL DEFAULT 'General'")
+    if "is_elective" not in subj_cols:
+        conn.execute("ALTER TABLE subjects ADD COLUMN is_elective INTEGER NOT NULL DEFAULT 0")
+    if "elective_group_id" not in subj_cols:
+        conn.execute("ALTER TABLE subjects ADD COLUMN elective_group_id TEXT")
     if "session_duration" not in subj_cols:
         conn.execute(
             "ALTER TABLE subjects ADD COLUMN session_duration INTEGER NOT NULL DEFAULT 1 CHECK (session_duration BETWEEN 1 AND 6)"
@@ -262,6 +357,84 @@ def init_db(conn: sqlite3.Connection) -> None:
     win_cols = {r[1] for r in conn.execute("PRAGMA table_info(exam_windows)").fetchall()}
     if "allowed_weekdays_json" not in win_cols:
         conn.execute("ALTER TABLE exam_windows ADD COLUMN allowed_weekdays_json TEXT NOT NULL DEFAULT '[0,1,2,3,4]'")
+
+    fac_cols = {r[1] for r in conn.execute("PRAGMA table_info(faculty)").fetchall()}
+    if "designation" not in fac_cols:
+        conn.execute("ALTER TABLE faculty ADD COLUMN designation TEXT")
+    if "max_daily_workload_hours" not in fac_cols:
+        conn.execute("ALTER TABLE faculty ADD COLUMN max_daily_workload_hours INTEGER")
+    if "lab_capable" not in fac_cols:
+        conn.execute("ALTER TABLE faculty ADD COLUMN lab_capable INTEGER NOT NULL DEFAULT 1")
+
+    grp_cols = {r[1] for r in conn.execute("PRAGMA table_info(student_groups)").fetchall()}
+    if "programme" not in grp_cols:
+        conn.execute("ALTER TABLE student_groups ADD COLUMN programme TEXT NOT NULL DEFAULT 'B.Tech.'")
+    if "department" not in grp_cols:
+        conn.execute("ALTER TABLE student_groups ADD COLUMN department TEXT NOT NULL DEFAULT 'AI&DS'")
+    if "semester" not in grp_cols:
+        conn.execute("ALTER TABLE student_groups ADD COLUMN semester INTEGER")
+    if "hall_no" not in grp_cols:
+        conn.execute("ALTER TABLE student_groups ADD COLUMN hall_no TEXT")
+    if "class_advisor" not in grp_cols:
+        conn.execute("ALTER TABLE student_groups ADD COLUMN class_advisor TEXT")
+    if "co_advisor" not in grp_cols:
+        conn.execute("ALTER TABLE student_groups ADD COLUMN co_advisor TEXT")
+    if "effective_from" not in grp_cols:
+        conn.execute("ALTER TABLE student_groups ADD COLUMN effective_from TEXT")
+
+    gss_cols = {r[1] for r in conn.execute("PRAGMA table_info(group_subject_settings)").fetchall()}
+    if "relation_type" not in gss_cols:
+        conn.execute("ALTER TABLE group_subject_settings ADD COLUMN relation_type TEXT NOT NULL DEFAULT 'PARALLEL_BATCH'")
+    if "staff_per_batch" not in gss_cols:
+        conn.execute("ALTER TABLE group_subject_settings ADD COLUMN staff_per_batch INTEGER NOT NULL DEFAULT 1")
+    if "periods_per_week_override" not in gss_cols:
+        conn.execute("ALTER TABLE group_subject_settings ADD COLUMN periods_per_week_override INTEGER")
+
+    saved_cols = {r[1] for r in conn.execute("PRAGMA table_info(saved_schedules)").fetchall()}
+    if "input_hash" not in saved_cols:
+        conn.execute("ALTER TABLE saved_schedules ADD COLUMN input_hash TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_saved_schedules_hash ON saved_schedules(schedule_type, input_hash, created_at)"
+    )
+
+    # Ensure new tables exist for older DBs (idempotent)
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS elective_groups (
+            elective_group_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'Professional' CHECK (kind IN ('Professional','Open','Management','Mandatory','Other')),
+            department TEXT,
+            semester INTEGER CHECK (semester BETWEEN 1 AND 8),
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS elective_group_subjects (
+            elective_group_id TEXT NOT NULL,
+            subject_code TEXT NOT NULL,
+            PRIMARY KEY (elective_group_id, subject_code),
+            FOREIGN KEY (elective_group_id) REFERENCES elective_groups(elective_group_id) ON DELETE CASCADE,
+            FOREIGN KEY (subject_code) REFERENCES subjects(subject_code) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS weekly_class_locks (
+            lock_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL,
+            day TEXT NOT NULL,
+            slot INTEGER NOT NULL,
+            subject_code TEXT,
+            faculty_id TEXT,
+            subgroup_id TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (group_id) REFERENCES student_groups(group_id) ON DELETE CASCADE,
+            FOREIGN KEY (subject_code) REFERENCES subjects(subject_code) ON DELETE SET NULL,
+            FOREIGN KEY (faculty_id) REFERENCES faculty(faculty_id) ON DELETE SET NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_weekly_class_locks_unique
+        ON weekly_class_locks(group_id, day, slot, subgroup_id);
+        """
+    )
     conn.commit()
 
 

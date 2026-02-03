@@ -35,6 +35,119 @@ from ui.database.db import db_session
 from ui.utils.id_generator import new_short_id
 
 
+def _suggest_exam_parameters(
+    problem: ExamProblem,
+    *,
+    use_rooms: bool,
+    enforce_capacity: bool,
+    blocked_slots_count: int,
+    enforce_same_weight: bool,
+    hard_gap_days: int,
+) -> dict:
+    """Suggest optimizer + preference parameters for the current exam problem.
+
+    Heuristic goals:
+    - keep runtime reasonable
+    - increase steps/reheats when the problem is tight (many exams per available sessions)
+    - avoid extreme soft-weights that slow convergence
+    """
+
+    n_exams = max(1, len(problem.exams))
+    n_days = max(1, len(problem.days))
+    sessions_per_day = max(1, int(problem.slots_per_day))  # UI fixes this to 2
+    capacity = n_days * sessions_per_day
+    fill = n_exams / max(1, capacity)
+
+    blocked_frac = float(blocked_slots_count) / max(1, capacity)
+
+    # Same-weight bucket sizes help decide whether the preference matters.
+    buckets: dict[tuple[int, int], int] = {}
+    for e in problem.exams.values():
+        yr = int(getattr(e, "academic_year", 0) or 0)
+        wt = int(getattr(e, "difficulty", 0) or 0)
+        if yr <= 0 or wt <= 0:
+            continue
+        buckets[(yr, wt)] = buckets.get((yr, wt), 0) + 1
+    avg_bucket = (sum(buckets.values()) / max(1, len(buckets))) if buckets else 1.0
+    max_bucket = max(buckets.values()) if buckets else 1
+
+    # Hardness score: higher => increase steps and reheats.
+    hardness = 1.0
+    hardness += 2.5 * min(1.2, max(0.0, fill))
+    hardness += 1.3 * min(1.0, max(0.0, blocked_frac))
+    if use_rooms and enforce_capacity:
+        hardness += 0.6
+    if enforce_same_weight:
+        hardness += 0.6
+    if int(hard_gap_days) >= 2:
+        hardness += 0.3
+
+    # Steps: scale with exams; clamp to UI limits.
+    base = 12_000 + int(n_exams * 1_600)
+    steps_balanced = int(min(200_000, max(10_000, base * hardness)))
+    reheats_balanced = 0 if steps_balanced < 40_000 else (1 if steps_balanced < 110_000 else 2)
+
+    # Preference weights: keep moderate and scale with fill.
+    def clamp(x: float, lo: float, hi: float) -> float:
+        return float(max(lo, min(hi, x)))
+
+    avoid_first = clamp(0.8 + 0.6 * min(1.0, fill), 0.0, 10.0)
+    avoid_last = clamp(0.8 + 0.6 * min(1.0, fill), 0.0, 10.0)
+    spread = clamp(1.0 + 2.5 * min(1.0, fill), 0.0, 10.0)
+
+    avoid_same_dg = clamp(4.0 + 8.0 * min(1.0, fill), 0.0, 20.0)
+    hard_gap_weight = clamp(2.0 + 6.0 * min(1.0, fill), 0.0, 20.0)
+
+    # If buckets are large (many subjects share the same weight in a year), this preference matters.
+    same_weight_pref = 6.0 + 2.0 * min(6.0, avg_bucket) + 1.0 * min(6.0, max_bucket)
+    prefer_same_weight = clamp(same_weight_pref, 0.0, 50.0)
+
+    rec = {
+        "stats": {
+            "exams": n_exams,
+            "days": n_days,
+            "sessions_per_day": sessions_per_day,
+            "capacity (days*sessions)": capacity,
+            "fill (exams/capacity)": fill,
+            "blocked_slots": int(blocked_slots_count),
+            "blocked_fraction": blocked_frac,
+            "avg_bucket_size (year*weight)": avg_bucket,
+            "max_bucket_size (year*weight)": max_bucket,
+        },
+        "fast": {
+            "steps": int(max(10_000, min(120_000, steps_balanced * 0.55))),
+            "reheats": 1 if steps_balanced >= 70_000 else 0,
+            "avoid_first": clamp(avoid_first * 0.8, 0.0, 10.0),
+            "avoid_last": clamp(avoid_last * 0.8, 0.0, 10.0),
+            "spread": clamp(spread * 0.8, 0.0, 10.0),
+            "avoid_same_dg": clamp(avoid_same_dg * 0.8, 0.0, 20.0),
+            "hard_gap_weight": clamp(hard_gap_weight * 0.8, 0.0, 20.0),
+            "prefer_same_weight": clamp(prefer_same_weight * 0.85, 0.0, 50.0),
+        },
+        "balanced": {
+            "steps": int(steps_balanced),
+            "reheats": int(reheats_balanced),
+            "avoid_first": avoid_first,
+            "avoid_last": avoid_last,
+            "spread": spread,
+            "avoid_same_dg": avoid_same_dg,
+            "hard_gap_weight": hard_gap_weight,
+            "prefer_same_weight": prefer_same_weight,
+        },
+        "quality": {
+            "steps": int(min(200_000, max(30_000, steps_balanced * 1.45))),
+            "reheats": int(min(4, max(reheats_balanced, 2))),
+            "avoid_first": clamp(avoid_first * 1.1, 0.0, 10.0),
+            "avoid_last": clamp(avoid_last * 1.1, 0.0, 10.0),
+            "spread": clamp(spread * 1.15, 0.0, 10.0),
+            "avoid_same_dg": clamp(avoid_same_dg * 1.1, 0.0, 20.0),
+            "hard_gap_weight": clamp(hard_gap_weight * 1.15, 0.0, 20.0),
+            "prefer_same_weight": clamp(prefer_same_weight * 1.15, 0.0, 50.0),
+        },
+    }
+    return rec
+
+
 def _build_problem_from_db(
     *,
     days: list[str],
@@ -358,7 +471,8 @@ def main() -> None:
     # Fixed exam day structure: exactly 2 slots.
     slots_per_day_default = 2
 
-    days_csv = c1.text_input("Exam days (comma-separated)", value=", ".join(day_names))
+    st.session_state.setdefault("exam_days_csv", ", ".join(day_names))
+    days_csv = c1.text_input("Exam days (comma-separated)", value=str(st.session_state["exam_days_csv"]), key="exam_days_csv")
     slots_per_day = c2.number_input(
         "Slots per day (fixed)",
         min_value=2,
@@ -368,7 +482,8 @@ def main() -> None:
         help="Exam days have exactly two slots: Morning and Evening.",
     )
 
-    use_rooms = c3.checkbox("Use rooms", value=True)
+    st.session_state.setdefault("exam_use_rooms", True)
+    use_rooms = c3.checkbox("Use rooms", value=bool(st.session_state["exam_use_rooms"]), key="exam_use_rooms")
 
     st.subheader("Scope")
     c_scope1, c_scope2 = st.columns([2, 1])
@@ -403,11 +518,51 @@ def main() -> None:
 
     st.subheader("Constraints & preferences")
     c4, c5, c6 = st.columns(3)
-    enforce_capacity = c4.checkbox("Enforce room capacity (hard)", value=True, disabled=not use_rooms)
-    avoid_first = c5.slider("Avoid first slot", min_value=0.0, max_value=10.0, value=1.0, step=0.5)
-    avoid_last = c6.slider("Avoid last slot", min_value=0.0, max_value=10.0, value=1.0, step=0.5)
+    st.session_state.setdefault("exam_enforce_capacity", True)
+    st.session_state.setdefault("exam_avoid_first", 1.0)
+    st.session_state.setdefault("exam_avoid_last", 1.0)
+    st.session_state.setdefault("exam_spread", 1.0)
+    st.session_state.setdefault("exam_avoid_same_dg", 5.0)
+    st.session_state.setdefault("exam_hard_threshold", 4)
+    st.session_state.setdefault("exam_hard_gap_days", 1)
+    st.session_state.setdefault("exam_hard_gap_weight", 3.0)
+    st.session_state.setdefault("exam_enforce_same_weight", False)
+    st.session_state.setdefault("exam_prefer_same_weight", 10.0)
+    st.session_state.setdefault("exam_steps", 30_000)
+    st.session_state.setdefault("exam_reheats", 1)
+    st.session_state.setdefault("exam_seed", 42)
 
-    spread = st.slider("Spread exams for each group (same-day penalty)", min_value=0.0, max_value=10.0, value=1.0, step=0.5)
+    enforce_capacity = c4.checkbox(
+        "Enforce room capacity (hard)",
+        value=bool(st.session_state["exam_enforce_capacity"]),
+        disabled=not use_rooms,
+        key="exam_enforce_capacity",
+    )
+    avoid_first = c5.slider(
+        "Avoid first slot",
+        min_value=0.0,
+        max_value=10.0,
+        value=float(st.session_state["exam_avoid_first"]),
+        step=0.5,
+        key="exam_avoid_first",
+    )
+    avoid_last = c6.slider(
+        "Avoid last slot",
+        min_value=0.0,
+        max_value=10.0,
+        value=float(st.session_state["exam_avoid_last"]),
+        step=0.5,
+        key="exam_avoid_last",
+    )
+
+    spread = st.slider(
+        "Spread exams for each group (same-day penalty)",
+        min_value=0.0,
+        max_value=10.0,
+        value=float(st.session_state["exam_spread"]),
+        step=0.5,
+        key="exam_spread",
+    )
 
     st.subheader("Difficulty-based preferences")
     cdp1, cdp2, cdp3, cdp4 = st.columns(4)
@@ -415,12 +570,34 @@ def main() -> None:
         "Avoid same difficulty-group on same day",
         min_value=0.0,
         max_value=20.0,
-        value=5.0,
+        value=float(st.session_state["exam_avoid_same_dg"]),
         step=0.5,
+        key="exam_avoid_same_dg",
     )
-    hard_threshold = cdp2.selectbox("Hard exam threshold", options=[3, 4, 5], index=[3, 4, 5].index(4))
-    hard_gap_days = cdp3.number_input("Min gap days between hard exams", min_value=0, max_value=7, value=1, step=1)
-    hard_gap_weight = cdp4.slider("Hard exam gap weight", min_value=0.0, max_value=20.0, value=3.0, step=0.5)
+    ht_default = int(st.session_state.get("exam_hard_threshold") or 4)
+    ht_default = ht_default if ht_default in (3, 4, 5) else 4
+    hard_threshold = cdp2.selectbox(
+        "Hard exam threshold",
+        options=[3, 4, 5],
+        index=[3, 4, 5].index(ht_default),
+        key="exam_hard_threshold",
+    )
+    hard_gap_days = cdp3.number_input(
+        "Min gap days between hard exams",
+        min_value=0,
+        max_value=7,
+        value=int(st.session_state["exam_hard_gap_days"]),
+        step=1,
+        key="exam_hard_gap_days",
+    )
+    hard_gap_weight = cdp4.slider(
+        "Hard exam gap weight",
+        min_value=0.0,
+        max_value=20.0,
+        value=float(st.session_state["exam_hard_gap_weight"]),
+        step=0.5,
+        key="exam_hard_gap_weight",
+    )
 
     st.subheader("College rule: same weight → same session")
     st.caption(
@@ -428,21 +605,128 @@ def main() -> None:
         "This supports parallel exams across departments."
     )
     cwr1, cwr2 = st.columns([1, 2])
-    enforce_same_weight = cwr1.checkbox("Enforce (hard)", value=False)
+    enforce_same_weight = cwr1.checkbox("Enforce (hard)", value=bool(st.session_state["exam_enforce_same_weight"]), key="exam_enforce_same_weight")
     prefer_same_weight = cwr2.slider(
         "Preference strength",
         min_value=0.0,
         max_value=50.0,
-        value=10.0,
+        value=float(st.session_state["exam_prefer_same_weight"]),
         step=1.0,
         help="If not enforced, higher values push the optimizer to keep same-year same-weight exams in one session.",
+        key="exam_prefer_same_weight",
     )
+
+    with st.expander("Auto-tune (recommended)"):
+        st.caption(
+            "Analyzes the current scope (selected years + window/days) and suggests parameters for speed vs quality."
+        )
+        c_at1, c_at2 = st.columns([1, 2])
+        profile = c_at1.radio(
+            "Profile",
+            options=["Balanced", "Fast", "Quality"],
+            horizontal=True,
+            key="exam_auto_profile",
+        )
+
+        if c_at2.button("Suggest & apply", type="secondary"):
+            # Build a concrete days list (window overrides days_csv) so capacity estimates are accurate.
+            days = [x.strip() for x in str(days_csv).split(",") if x.strip()]
+            blocked_pairs: list[tuple[int, int]] = []
+            if selected_window_id:
+                with db_session() as conn:
+                    win = crud.get_exam_window(conn, selected_window_id)
+                    blocks = crud.list_exam_blocks(conn, window_id=selected_window_id)
+                if win is not None:
+                    days, blocked_pairs = _as_calendar_days(window=win, blocks=blocks)
+
+            if not selected_years:
+                st.error("Select at least one academic year first.")
+            elif not days:
+                st.error("Provide exam days or select an exam window first.")
+            else:
+                p = _build_problem_from_db(
+                    days=days,
+                    slots_per_day=int(slots_per_day),
+                    use_rooms=bool(use_rooms),
+                    selected_years=[int(x) for x in selected_years],
+                    combine_years=bool(combine_years),
+                )
+                if blocked_pairs:
+                    p = ExamProblem(
+                        days=p.days,
+                        slots_per_day=p.slots_per_day,
+                        groups=p.groups,
+                        rooms=p.rooms,
+                        exams=p.exams,
+                        blocked_slots=tuple(blocked_pairs),
+                    )
+
+                rec = _suggest_exam_parameters(
+                    p,
+                    use_rooms=bool(use_rooms),
+                    enforce_capacity=bool(enforce_capacity) if bool(use_rooms) else False,
+                    blocked_slots_count=int(len(blocked_pairs)),
+                    enforce_same_weight=bool(enforce_same_weight),
+                    hard_gap_days=int(hard_gap_days),
+                )
+                st.session_state["exam_autotune_last"] = rec
+
+                chosen_key = profile.lower()
+                chosen = rec.get(chosen_key, rec["balanced"])
+
+                st.session_state["exam_steps"] = int(chosen["steps"])
+                st.session_state["exam_reheats"] = int(chosen["reheats"])
+                st.session_state["exam_avoid_first"] = float(chosen["avoid_first"])
+                st.session_state["exam_avoid_last"] = float(chosen["avoid_last"])
+                st.session_state["exam_spread"] = float(chosen["spread"])
+                st.session_state["exam_avoid_same_dg"] = float(chosen["avoid_same_dg"])
+                st.session_state["exam_hard_gap_weight"] = float(chosen["hard_gap_weight"])
+                st.session_state["exam_prefer_same_weight"] = float(chosen["prefer_same_weight"])
+
+                st.success("Auto-tune applied. You can now run the scheduler.")
+                st.rerun()
+
+        last = st.session_state.get("exam_autotune_last")
+        if last and isinstance(last, dict):
+            stats = last.get("stats") or {}
+            st.write(
+                {
+                    "exams": stats.get("exams"),
+                    "days": stats.get("days"),
+                    "sessions/day": stats.get("sessions_per_day"),
+                    "capacity": stats.get("capacity (days*sessions)"),
+                    "fill": round(float(stats.get("fill (exams/capacity)") or 0.0), 3),
+                    "blocked_slots": stats.get("blocked_slots"),
+                    "blocked_fraction": round(float(stats.get("blocked_fraction") or 0.0), 3),
+                    "avg_bucket_size(year*weight)": round(float(stats.get("avg_bucket_size (year*weight)") or 0.0), 2),
+                    "max_bucket_size(year*weight)": stats.get("max_bucket_size (year*weight)"),
+                }
+            )
 
     st.subheader("Optimizer (QISA)")
     c7, c8, c9 = st.columns(3)
-    steps = c7.number_input("Annealing steps", min_value=1_000, max_value=200_000, value=30_000, step=1_000)
-    reheats = c8.number_input("Reheats", min_value=0, max_value=10, value=1)
-    seed = c9.number_input("Random seed", min_value=0, max_value=10_000, value=42)
+    steps = c7.number_input(
+        "Annealing steps",
+        min_value=1_000,
+        max_value=200_000,
+        value=int(st.session_state["exam_steps"]),
+        step=1_000,
+        key="exam_steps",
+    )
+    reheats = c8.number_input(
+        "Reheats",
+        min_value=0,
+        max_value=10,
+        value=int(st.session_state["exam_reheats"]),
+        key="exam_reheats",
+    )
+    seed = c9.number_input(
+        "Random seed",
+        min_value=0,
+        max_value=10_000,
+        value=int(st.session_state["exam_seed"]),
+        key="exam_seed",
+    )
 
     # Saved schedules
     st.subheader("Saved schedules")

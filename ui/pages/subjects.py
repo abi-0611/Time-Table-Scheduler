@@ -17,7 +17,15 @@ if str(ROOT) not in sys.path:
 
 from ui.database.db import db_session
 from ui.database import crud
-from ui.utils.validators import validate_id, validate_positive_int, require_non_empty
+from ui.utils.validators import (
+    require_non_empty,
+    validate_elective,
+    validate_id,
+    validate_lab_block,
+    validate_positive_int,
+    validate_subject_ltp,
+    validate_weekly_hours_divisible,
+)
 
 
 def main() -> None:
@@ -25,6 +33,9 @@ def main() -> None:
 
     with db_session() as conn:
         subjects = crud.list_subjects(conn)
+        elective_groups = crud.list_elective_groups(conn)
+
+    elective_group_ids = [g["elective_group_id"] for g in elective_groups]
 
     tab_add, tab_view = st.tabs(["Add / Update", "View / Delete"])
 
@@ -61,11 +72,62 @@ def main() -> None:
                 max_value=4,
                 value=int((initial.get("academic_year", 3) if initial else 3)),
             )
-            weekly_hours = c4.number_input(
-                "Weekly Hours",
+            semester = c4.number_input(
+                "Semester (I–VIII)",
+                min_value=1,
+                max_value=8,
+                value=int((initial.get("semester", 5) if initial and initial.get("semester") is not None else 5)),
+                help="Matches spreadsheet fields like 'SEMESTER : III' and 'Semester / Branch'.",
+            )
+
+            c_dept, c_type = st.columns(2)
+            department = c_dept.text_input(
+                "Department",
+                value=str((initial.get("department", "AI&DS") if initial else "AI&DS")),
+                help="Seen as 'Dept' in class timetable subject list and in workload sheets.",
+            )
+            subject_type = c_type.selectbox(
+                "Type",
+                options=["Theory", "Lab", "Tutorial", "Project", "Library", "Mentoring", "Other"],
+                index=["Theory", "Lab", "Tutorial", "Project", "Library", "Mentoring", "Other"].index(
+                    str((initial.get("subject_type") if initial else "Theory"))
+                    if str((initial.get("subject_type") if initial else "Theory"))
+                    in ["Theory", "Lab", "Tutorial", "Project", "Library", "Mentoring", "Other"]
+                    else "Theory"
+                ),
+                help="Spreadsheets separate THEORY vs PRACTICAL and include Library/Mentoring/Project Work entries.",
+            )
+
+            st.divider()
+            st.subheader("Weekly requirement (L/T/P)")
+            cL, cT, cP, cW = st.columns(4)
+            l_hours = cL.number_input(
+                "L",
+                min_value=0,
+                max_value=20,
+                value=int((initial.get("l_hours", 0) if initial else 0)),
+                help="Lecture periods/week (L column in class timetable subject list).",
+            )
+            t_hours = cT.number_input(
+                "T",
+                min_value=0,
+                max_value=20,
+                value=int((initial.get("t_hours", 0) if initial else 0)),
+                help="Tutorial periods/week (T column in workload allocation).",
+            )
+            p_hours = cP.number_input(
+                "P",
+                min_value=0,
+                max_value=20,
+                value=int((initial.get("p_hours", 0) if initial else 0)),
+                help="Practical periods/week (P column / Practical load).",
+            )
+            weekly_hours = cW.number_input(
+                "Weekly Hours (scheduler)",
                 min_value=1,
                 max_value=20,
                 value=int((initial.get("weekly_hours", 3) if initial else 3)),
+                help="Used by the current scheduler to create N sessions. Keep consistent with L/T/P as needed.",
             )
 
             c5, c6 = st.columns(2)
@@ -76,7 +138,46 @@ def main() -> None:
                 value=int((initial.get("session_duration", 1) if initial else 1)),
                 help="How many consecutive periods this subject occupies per session. Example: Lab=4",
             )
-            c6.caption("Tip: Lecture=1, Lab=2–4")
+            lab_block_size = c6.number_input(
+                "Lab block size (if Lab)",
+                min_value=1,
+                max_value=8,
+                value=int((initial.get("lab_block_size", 4) if initial and initial.get("lab_block_size") is not None else 4)),
+                help="Block size in continuous periods for practicals (seen as Practical periods/week + batches in workload format).",
+            )
+
+            st.divider()
+            st.subheader("Importance / grouping")
+            c_imp, c_grp = st.columns(2)
+            importance_weight = c_imp.slider(
+                "Importance weight",
+                min_value=0.1,
+                max_value=10.0,
+                value=float((initial.get("importance_weight", 1.0) if initial else 1.0)),
+                step=0.1,
+                help="Admin-entered weight to express importance/difficulty in weekly scheduling priorities.",
+            )
+            difficulty_group_id = c_grp.text_input(
+                "Difficulty group ID",
+                value=str((initial.get("difficulty_group_id", "General") if initial else "General")),
+                help="Group subjects across departments/sections for policy constraints (separate from exam difficulty group).",
+            )
+
+            st.divider()
+            st.subheader("Elective")
+            c_el1, c_el2 = st.columns(2)
+            is_elective = c_el1.checkbox(
+                "Is elective?",
+                value=bool(int((initial.get("is_elective", 0) if initial else 0))),
+                help="Spreadsheets include Professional Electives and Open Electives.",
+            )
+            elective_group_id = c_el2.selectbox(
+                "Elective group",
+                options=[""] + elective_group_ids,
+                index=([""] + elective_group_ids).index(str(initial.get("elective_group_id") or "") if initial else ""),
+                help="Required when Is elective is enabled. Manage elective groups in the Electives page.",
+                disabled=not is_elective,
+            )
 
             st.divider()
             st.subheader("Lab / long-session preferences")
@@ -150,7 +251,36 @@ def main() -> None:
             if not ok:
                 st.error(msg)
                 st.stop()
+
+            ok, msg = require_non_empty(department, "Department")
+            if not ok:
+                st.error(msg)
+                st.stop()
+
+            ok, msg = validate_subject_ltp(l_hours=int(l_hours), t_hours=int(t_hours), p_hours=int(p_hours))
+            if not ok:
+                st.error(msg)
+                st.stop()
+
             ok, msg = validate_positive_int(int(weekly_hours), "Weekly Hours", 1, 20)
+            if not ok:
+                st.error(msg)
+                st.stop()
+
+            ok, msg = validate_weekly_hours_divisible(
+                weekly_hours=int(weekly_hours),
+                session_duration=int(session_duration),
+            )
+            if not ok:
+                st.error(msg)
+                st.stop()
+
+            ok, msg = validate_lab_block(subject_type=str(subject_type), lab_block_size=int(lab_block_size), session_duration=int(session_duration))
+            if not ok:
+                st.error(msg)
+                st.stop()
+
+            ok, msg = validate_elective(is_elective=bool(is_elective), elective_group_id=str(elective_group_id) if elective_group_id else None)
             if not ok:
                 st.error(msg)
                 st.stop()
@@ -160,6 +290,17 @@ def main() -> None:
                     conn,
                     subject_code=subject_code.strip(),
                     subject_name=subject_name.strip(),
+                    department=department.strip(),
+                    semester=int(semester),
+                    subject_type=str(subject_type),
+                    l_hours=int(l_hours),
+                    t_hours=int(t_hours),
+                    p_hours=int(p_hours),
+                    lab_block_size=int(lab_block_size) if str(subject_type) == "Lab" else None,
+                    importance_weight=float(importance_weight),
+                    difficulty_group_id=str(difficulty_group_id).strip() or "General",
+                    is_elective=1 if is_elective else 0,
+                    elective_group_id=(str(elective_group_id).strip() if is_elective and elective_group_id else None),
                     academic_year=int(academic_year),
                     weekly_hours=int(weekly_hours),
                     session_duration=int(session_duration),
