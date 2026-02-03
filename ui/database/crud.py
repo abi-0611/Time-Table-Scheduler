@@ -123,6 +123,9 @@ def list_subjects(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         r.setdefault("split_pattern", "consecutive")
         r.setdefault("allow_wrap_split", 0)
         r.setdefault("time_preference", "Any")
+        r.setdefault("exam_difficulty", 3)
+        r.setdefault("exam_difficulty_group", "General")
+        r.setdefault("exam_duration_minutes", 180)
     return rows
 
 
@@ -138,14 +141,18 @@ def upsert_subject(
     split_pattern: str = "consecutive",
     allow_wrap_split: int = 0,
     time_preference: str = "Any",
+    exam_difficulty: int = 3,
+    exam_difficulty_group: str = "General",
+    exam_duration_minutes: int = 180,
 ) -> None:
     conn.execute(
         """
         INSERT INTO subjects (
             subject_code, subject_name, academic_year, weekly_hours, session_duration,
-            allow_split, split_pattern, allow_wrap_split, time_preference
+            allow_split, split_pattern, allow_wrap_split, time_preference,
+            exam_difficulty, exam_difficulty_group, exam_duration_minutes
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(subject_code) DO UPDATE SET
             subject_name=excluded.subject_name,
             academic_year=excluded.academic_year,
@@ -154,7 +161,10 @@ def upsert_subject(
             allow_split=excluded.allow_split,
             split_pattern=excluded.split_pattern,
             allow_wrap_split=excluded.allow_wrap_split,
-            time_preference=excluded.time_preference
+            time_preference=excluded.time_preference,
+            exam_difficulty=excluded.exam_difficulty,
+            exam_difficulty_group=excluded.exam_difficulty_group,
+            exam_duration_minutes=excluded.exam_duration_minutes
         """,
         (
             subject_code,
@@ -166,6 +176,9 @@ def upsert_subject(
             str(split_pattern),
             int(allow_wrap_split),
             str(time_preference),
+            int(exam_difficulty),
+            str(exam_difficulty_group),
+            int(exam_duration_minutes),
         ),
     )
 
@@ -359,3 +372,147 @@ def get_saved_schedule(conn: sqlite3.Connection, schedule_id: str) -> Optional[D
 
 def delete_saved_schedule(conn: sqlite3.Connection, schedule_id: str) -> None:
     conn.execute("DELETE FROM saved_schedules WHERE schedule_id=?", (schedule_id,))
+
+
+# -----------------
+# Exam windows/runs
+# -----------------
+
+
+def create_exam_window(
+    conn: sqlite3.Connection,
+    *,
+    window_id: str,
+    name: str,
+    start_date: str,
+    end_date: str,
+    exclude_weekends: bool = True,
+    allowed_weekdays: Optional[List[int]] = None,
+    holidays: Optional[List[str]] = None,
+) -> None:
+    # Default: Mon-Fri (Python weekday: Mon=0 .. Sun=6)
+    if allowed_weekdays is None:
+        allowed_weekdays = [0, 1, 2, 3, 4] if exclude_weekends else [0, 1, 2, 3, 4, 5, 6]
+    conn.execute(
+        """
+        INSERT INTO exam_windows (window_id, name, start_date, end_date, exclude_weekends, allowed_weekdays_json, holidays_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(window_id) DO UPDATE SET
+            name=excluded.name,
+            start_date=excluded.start_date,
+            end_date=excluded.end_date,
+            exclude_weekends=excluded.exclude_weekends,
+            allowed_weekdays_json=excluded.allowed_weekdays_json,
+            holidays_json=excluded.holidays_json
+        """,
+        (
+            window_id,
+            name,
+            start_date,
+            end_date,
+            1 if exclude_weekends else 0,
+            json.dumps(list(allowed_weekdays or [])),
+            json.dumps(holidays or []),
+        ),
+    )
+
+
+def list_exam_windows(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    rows = _rows(conn, "SELECT * FROM exam_windows ORDER BY created_at DESC")
+    for r in rows:
+        r["exclude_weekends"] = bool(int(r.get("exclude_weekends", 1)))
+        r["allowed_weekdays"] = json.loads(r.get("allowed_weekdays_json") or "[0,1,2,3,4]")
+        r["holidays"] = json.loads(r.get("holidays_json") or "[]")
+    return rows
+
+
+def get_exam_window(conn: sqlite3.Connection, window_id: str) -> Optional[Dict[str, Any]]:
+    r = _row(conn, "SELECT * FROM exam_windows WHERE window_id=?", (window_id,))
+    if r is None:
+        return None
+    r["exclude_weekends"] = bool(int(r.get("exclude_weekends", 1)))
+    r["allowed_weekdays"] = json.loads(r.get("allowed_weekdays_json") or "[0,1,2,3,4]")
+    r["holidays"] = json.loads(r.get("holidays_json") or "[]")
+    return r
+
+
+def delete_exam_window(conn: sqlite3.Connection, window_id: str) -> None:
+    conn.execute("DELETE FROM exam_windows WHERE window_id=?", (window_id,))
+
+
+def list_exam_blocks(conn: sqlite3.Connection, window_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    if window_id:
+        return _rows(
+            conn,
+            "SELECT * FROM exam_blocks WHERE window_id=? ORDER BY block_date, slot",
+            (window_id,),
+        )
+    return _rows(conn, "SELECT * FROM exam_blocks ORDER BY block_date, slot")
+
+
+def upsert_exam_block(
+    conn: sqlite3.Connection,
+    *,
+    window_id: Optional[str],
+    block_date: str,
+    slot: int,
+    reason: str = "",
+) -> None:
+    # Unique index enforces (window_id, date, slot) uniqueness. Since window_id may be null,
+    # we store null values directly and rely on the UI to use a window.
+    conn.execute(
+        """
+        INSERT INTO exam_blocks (window_id, block_date, slot, reason)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(window_id, block_date, slot) DO UPDATE SET
+            reason=excluded.reason
+        """,
+        (window_id, block_date, int(slot), reason),
+    )
+
+
+def delete_exam_block(conn: sqlite3.Connection, block_id: int) -> None:
+    conn.execute("DELETE FROM exam_blocks WHERE block_id=?", (int(block_id),))
+
+
+def create_exam_run(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    schedule_id: str,
+    window_id: Optional[str],
+    settings: Dict[str, Any],
+    metrics: Dict[str, Any],
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO exam_runs (run_id, schedule_id, window_id, settings_json, metrics_json)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (run_id, schedule_id, window_id, json.dumps(settings), json.dumps(metrics)),
+    )
+
+
+def list_exam_runs(conn: sqlite3.Connection, window_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    if window_id:
+        rows = _rows(conn, "SELECT * FROM exam_runs WHERE window_id=? ORDER BY created_at DESC", (window_id,))
+    else:
+        rows = _rows(conn, "SELECT * FROM exam_runs ORDER BY created_at DESC")
+
+    for r in rows:
+        r["settings"] = json.loads(r.get("settings_json") or "{}")
+        r["metrics"] = json.loads(r.get("metrics_json") or "{}")
+    return rows
+
+
+def get_exam_run(conn: sqlite3.Connection, run_id: str) -> Optional[Dict[str, Any]]:
+    r = _row(conn, "SELECT * FROM exam_runs WHERE run_id=?", (run_id,))
+    if r is None:
+        return None
+    r["settings"] = json.loads(r.get("settings_json") or "{}")
+    r["metrics"] = json.loads(r.get("metrics_json") or "{}")
+    return r
+
+
+def delete_exam_run(conn: sqlite3.Connection, run_id: str) -> None:
+    conn.execute("DELETE FROM exam_runs WHERE run_id=?", (run_id,))

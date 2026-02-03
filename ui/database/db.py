@@ -90,7 +90,11 @@ def init_db(conn: sqlite3.Connection) -> None:
             allow_split INTEGER NOT NULL DEFAULT 0 CHECK (allow_split IN (0,1)),
             split_pattern TEXT NOT NULL DEFAULT 'consecutive',
             allow_wrap_split INTEGER NOT NULL DEFAULT 0 CHECK (allow_wrap_split IN (0,1)),
-            time_preference TEXT NOT NULL DEFAULT 'Any' CHECK (time_preference IN ('Any','Early','Middle','Late'))
+            time_preference TEXT NOT NULL DEFAULT 'Any' CHECK (time_preference IN ('Any','Early','Middle','Late')),
+            -- Exam metadata (used by exam scheduler upgrades)
+            exam_difficulty INTEGER NOT NULL DEFAULT 3 CHECK (exam_difficulty BETWEEN 1 AND 5),
+            exam_difficulty_group TEXT NOT NULL DEFAULT 'General',
+            exam_duration_minutes INTEGER NOT NULL DEFAULT 180 CHECK (exam_duration_minutes BETWEEN 30 AND 480)
         );
 
         CREATE TABLE IF NOT EXISTS faculty (
@@ -160,6 +164,48 @@ def init_db(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (schedule_id) REFERENCES saved_schedules(schedule_id) ON DELETE CASCADE
         );
 
+        -- -----------------------------
+        -- Exam planning (calendar-based)
+        -- -----------------------------
+
+        -- Defines an exam window as a date range with 2 slots/day (Morning, Evening)
+        CREATE TABLE IF NOT EXISTS exam_windows (
+            window_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            start_date TEXT NOT NULL, -- ISO date YYYY-MM-DD
+            end_date TEXT NOT NULL,   -- ISO date YYYY-MM-DD
+            exclude_weekends INTEGER NOT NULL DEFAULT 1 CHECK (exclude_weekends IN (0,1)),
+            allowed_weekdays_json TEXT NOT NULL DEFAULT '[0,1,2,3,4]',
+            holidays_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        -- Dates/slots that are blocked (already scheduled, holidays, unavailable)
+        CREATE TABLE IF NOT EXISTS exam_blocks (
+            block_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            window_id TEXT,
+            block_date TEXT NOT NULL, -- ISO date YYYY-MM-DD
+            slot INTEGER NOT NULL CHECK (slot IN (1,2)),
+            reason TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (window_id) REFERENCES exam_windows(window_id) ON DELETE SET NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_exam_blocks_unique
+        ON exam_blocks(window_id, block_date, slot);
+
+        -- Stores exam run metadata (settings snapshot + metrics) and points to saved_schedules
+        CREATE TABLE IF NOT EXISTS exam_runs (
+            run_id TEXT PRIMARY KEY,
+            schedule_id TEXT NOT NULL,
+            window_id TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            settings_json TEXT NOT NULL DEFAULT '{}',
+            metrics_json TEXT NOT NULL DEFAULT '{}',
+            FOREIGN KEY (schedule_id) REFERENCES saved_schedules(schedule_id) ON DELETE CASCADE,
+            FOREIGN KEY (window_id) REFERENCES exam_windows(window_id) ON DELETE SET NULL
+        );
+
             CREATE UNIQUE INDEX IF NOT EXISTS uq_saved_entries_identity
             ON saved_schedule_entries(
                 schedule_id,
@@ -195,6 +241,14 @@ def init_db(conn: sqlite3.Connection) -> None:
             "ALTER TABLE subjects ADD COLUMN time_preference TEXT NOT NULL DEFAULT 'Any' CHECK (time_preference IN ('Any','Early','Middle','Late'))"
         )
 
+    # Exam metadata migrations
+    if "exam_difficulty" not in subj_cols:
+        conn.execute("ALTER TABLE subjects ADD COLUMN exam_difficulty INTEGER NOT NULL DEFAULT 3 CHECK (exam_difficulty BETWEEN 1 AND 5)")
+    if "exam_difficulty_group" not in subj_cols:
+        conn.execute("ALTER TABLE subjects ADD COLUMN exam_difficulty_group TEXT NOT NULL DEFAULT 'General'")
+    if "exam_duration_minutes" not in subj_cols:
+        conn.execute("ALTER TABLE subjects ADD COLUMN exam_duration_minutes INTEGER NOT NULL DEFAULT 180 CHECK (exam_duration_minutes BETWEEN 30 AND 480)")
+
     acad_cols = {r[1] for r in conn.execute("PRAGMA table_info(academic_structure)").fetchall()}
     if "break_boundaries_json" not in acad_cols:
         conn.execute("ALTER TABLE academic_structure ADD COLUMN break_boundaries_json TEXT NOT NULL DEFAULT '[]'")
@@ -204,6 +258,10 @@ def init_db(conn: sqlite3.Connection) -> None:
 
     if "main_break_slot" not in acad_cols:
         conn.execute("ALTER TABLE academic_structure ADD COLUMN main_break_slot INTEGER")
+
+    win_cols = {r[1] for r in conn.execute("PRAGMA table_info(exam_windows)").fetchall()}
+    if "allowed_weekdays_json" not in win_cols:
+        conn.execute("ALTER TABLE exam_windows ADD COLUMN allowed_weekdays_json TEXT NOT NULL DEFAULT '[0,1,2,3,4]'")
     conn.commit()
 
 

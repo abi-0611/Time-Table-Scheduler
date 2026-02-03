@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import uuid
 from typing import Optional
 
 
@@ -47,3 +48,17 @@ def generate_room_id(conn: sqlite3.Connection) -> str:
 
 def generate_group_id(conn: sqlite3.Connection) -> str:
     return generate_next_id(conn, table="student_groups", id_column="group_id", prefix="G", width=3)
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+def new_short_id(prefix: str) -> str:
+    """Generate a short stable ID for UI-created records.
+
+    Uses 12 hex chars for readability (similar to saved schedule ids).
+    """
+
+    return f"{prefix}-{uuid.uuid4().hex[:12]}"
+

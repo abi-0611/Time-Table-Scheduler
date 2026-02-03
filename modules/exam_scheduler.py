@@ -20,7 +20,7 @@ The module can be used:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import json
 import math
@@ -57,14 +57,26 @@ class Exam:
     duration_slots: int = 1
     invigilator_ids: Tuple[str, ...] = ()  # optional
 
+    # Year this exam belongs to (used for same-year clustering rules)
+    academic_year: int = 0
+
+    # Exam metadata (used for advanced scheduling preferences)
+    difficulty: int = 3  # 1 (easy) .. 5 (hard)
+    difficulty_group: str = "General"
+
 
 @dataclass(frozen=True)
 class ExamProblem:
+    # Days are represented as ISO date strings (YYYY-MM-DD) or labels.
+    # The UI upgrade will pass ISO dates when using exam windows.
     days: Tuple[str, ...]
     slots_per_day: int
     groups: Dict[str, StudentGroup]
     rooms: Dict[str, Room]
     exams: Dict[str, Exam]
+
+    # Optional hard blocks: (day_idx, slot_idx) tuples that cannot be used.
+    blocked_slots: Tuple[Tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -87,8 +99,20 @@ class ExamSchedulingSettings:
     prefer_avoid_last_slot: float = 1.0
     prefer_spread_exams_for_group: float = 1.0
 
+    # Advanced exam preferences
+    prefer_avoid_same_day_for_difficulty_group: float = 5.0
+    prefer_difficulty_gap_days: int = 1  # desired gap in days between hard exams for a group
+    prefer_difficulty_gap_weight: float = 3.0
+    hard_exam_threshold: int = 4  # exams with difficulty >= threshold are considered hard
+
     # Penalty weights
     hard_penalty: float = 1_000_000.0
+
+    # College-style rule:
+    # For a given academic year, subjects of the same weight/difficulty should be held
+    # in the same *session* (day+slot). This supports "parallel exams" across departments.
+    enforce_same_weight_same_session: bool = False
+    prefer_same_weight_same_session: float = 10.0
 
 
 # ----------------------------
@@ -160,14 +184,32 @@ def load_exam_problem_from_json(path: str) -> ExamProblem:
     return ExamProblem(days=days, slots_per_day=slots_per_day, groups=groups, rooms=rooms, exams=exams)
 
 
-def format_schedule_as_rows(problem: ExamProblem, state: ExamScheduleState) -> List[Dict[str, str]]:
-    """Return a list of rows suitable for tables/CSV."""
+def format_schedule_as_rows(
+    problem: ExamProblem,
+    state: ExamScheduleState,
+    *,
+    slot_labels: Optional[List[str]] = None,
+) -> List[Dict[str, str]]:
+    """Return a list of rows suitable for tables/CSV.
+
+    Args:
+        slot_labels: Optional list mapping slot_idx -> label (e.g., ["Morning", "Evening"]).
+            If provided, its length must match problem.slots_per_day.
+    """
+
+    if slot_labels is not None and len(slot_labels) != problem.slots_per_day:
+        raise ValueError("slot_labels length must equal problem.slots_per_day")
 
     rows: List[Dict[str, str]] = []
     for exam_id, exam in sorted(problem.exams.items(), key=lambda kv: kv[0]):
         a = state.assignments[exam_id]
         day = problem.days[a.day_idx]
-        slot = a.slot_idx + 1
+
+        if slot_labels is None:
+            slot_str = str(a.slot_idx + 1)
+        else:
+            slot_str = slot_labels[a.slot_idx]
+
         room = a.room_id or "-"
         groups = ", ".join(exam.group_ids)
         rows.append(
@@ -176,7 +218,7 @@ def format_schedule_as_rows(problem: ExamProblem, state: ExamScheduleState) -> L
                 "subject_code": exam.subject_code,
                 "subject_name": exam.subject_name,
                 "day": day,
-                "slot": str(slot),
+                "slot": slot_str,
                 "room": room,
                 "groups": groups,
             }
@@ -199,6 +241,8 @@ def compute_energy(problem: ExamProblem, settings: ExamSchedulingSettings, state
     hard = 0.0
     soft = 0.0
 
+    blocked: Set[Tuple[int, int]] = set(problem.blocked_slots) if problem.blocked_slots else set()
+
     # Build indexes
     group_occupancy: Dict[Tuple[str, Tuple[int, int]], List[str]] = {}
     invig_occupancy: Dict[Tuple[str, Tuple[int, int]], List[str]] = {}
@@ -207,6 +251,10 @@ def compute_energy(problem: ExamProblem, settings: ExamSchedulingSettings, state
     for exam_id, exam in problem.exams.items():
         a = state.assignments[exam_id]
         key = _timeslot_key(a.day_idx, a.slot_idx)
+
+        # Hard: respect blocked slots (incremental scheduling, holidays, unavailable sessions)
+        if blocked and (a.day_idx, a.slot_idx) in blocked:
+            hard += settings.hard_penalty
 
         # group conflicts
         for gid in exam.group_ids:
@@ -268,6 +316,67 @@ def compute_energy(problem: ExamProblem, settings: ExamSchedulingSettings, state
     for (_gid, _day), count in by_group_by_day.items():
         if count > 1:
             soft += settings.prefer_spread_exams_for_group * (count - 1)
+
+    # Same-year, same-weight should appear in the same session (day+slot).
+    # This is a college-specific preference where different departments run parallel exams.
+    # We cluster by (academic_year, difficulty(weight)).
+    if settings.enforce_same_weight_same_session or settings.prefer_same_weight_same_session > 0:
+        # Map bucket -> set of sessions used
+        # session key is (day_idx, slot_idx)
+        bucket_sessions: Dict[Tuple[int, int], Set[Tuple[int, int]]] = {}
+        for exam_id, exam in problem.exams.items():
+            yr = int(exam.academic_year or 0)
+            wt = int(exam.difficulty or 0)
+            if yr <= 0 or wt <= 0:
+                continue
+            a = state.assignments[exam_id]
+            bucket = (yr, wt)
+            bucket_sessions.setdefault(bucket, set()).add((a.day_idx, a.slot_idx))
+
+        for (_bucket, sessions_used) in bucket_sessions.items():
+            if len(sessions_used) <= 1:
+                continue
+            # If a year+weight is split across multiple sessions, penalize.
+            split = len(sessions_used) - 1
+            if settings.enforce_same_weight_same_session:
+                hard += settings.hard_penalty * split
+            else:
+                soft += settings.prefer_same_weight_same_session * split
+
+    # Soft: avoid two exams of the same difficulty group on the same day (per student group)
+    # This helps avoid stacking similar heavy/related exams.
+    if settings.prefer_avoid_same_day_for_difficulty_group > 0:
+        # index: (gid, day_idx, difficulty_group) -> count
+        dg_counts: Dict[Tuple[str, int, str], int] = {}
+        for exam_id, exam in problem.exams.items():
+            a = state.assignments[exam_id]
+            dg = (exam.difficulty_group or "General")
+            for gid in exam.group_ids:
+                key = (gid, a.day_idx, dg)
+                dg_counts[key] = dg_counts.get(key, 0) + 1
+        for (_gid, _day, _dg), count in dg_counts.items():
+            if count > 1:
+                soft += settings.prefer_avoid_same_day_for_difficulty_group * (count - 1)
+
+    # Soft: spread 'hard' exams for each group by (at least) N days.
+    if settings.prefer_difficulty_gap_weight > 0 and settings.prefer_difficulty_gap_days > 0:
+        hard_by_group: Dict[str, List[int]] = {}
+        for exam_id, exam in problem.exams.items():
+            if int(exam.difficulty) < int(settings.hard_exam_threshold):
+                continue
+            a = state.assignments[exam_id]
+            for gid in exam.group_ids:
+                hard_by_group.setdefault(gid, []).append(int(a.day_idx))
+
+        min_gap = int(settings.prefer_difficulty_gap_days)
+        for _gid, day_list in hard_by_group.items():
+            if len(day_list) <= 1:
+                continue
+            day_list = sorted(day_list)
+            for i in range(len(day_list) - 1):
+                gap = day_list[i + 1] - day_list[i]
+                if gap < min_gap:
+                    soft += settings.prefer_difficulty_gap_weight * float(min_gap - gap)
 
     return hard + soft
 

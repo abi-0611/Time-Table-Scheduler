@@ -114,6 +114,31 @@ def main() -> None:
                 help="Preference for where the whole block(s) should lie (soft preference).",
             )
 
+            st.divider()
+            st.subheader("Exam scheduling metadata")
+            c10, c11, c12 = st.columns(3)
+
+            exam_difficulty = c10.selectbox(
+                "Exam difficulty (1–5)",
+                options=[1, 2, 3, 4, 5],
+                index=[1, 2, 3, 4, 5].index(int((initial.get("exam_difficulty", 3) if initial else 3))),
+                help="Used for spacing difficult exams apart (soft constraint) in the exam scheduler.",
+            )
+
+            exam_difficulty_group = c11.text_input(
+                "Difficulty group",
+                value=str((initial.get("exam_difficulty_group", "General") if initial else "General")),
+                help="Subjects in the same group can be constrained to avoid being on the same day.",
+            )
+
+            exam_duration_minutes = c12.number_input(
+                "Exam duration (minutes)",
+                min_value=30,
+                max_value=480,
+                value=int((initial.get("exam_duration_minutes", 180) if initial else 180)),
+                step=30,
+            )
+
             submitted = st.form_submit_button("Save Subject")
 
         if submitted:
@@ -142,6 +167,9 @@ def main() -> None:
                     split_pattern=(split_pattern if allow_split else "consecutive"),
                     allow_wrap_split=1 if (allow_split and allow_wrap_split) else 0,
                     time_preference=str(time_preference),
+                    exam_difficulty=int(exam_difficulty),
+                    exam_difficulty_group=str(exam_difficulty_group).strip() or "General",
+                    exam_duration_minutes=int(exam_duration_minutes),
                 )
             st.success("Subject saved.")
 

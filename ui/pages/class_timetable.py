@@ -192,12 +192,17 @@ def _as_df_table(
 
     columns: list[str] = []
     col_map: list[int | None] = []  # None means separator column
+    sep_count = 0
     for i in range(1, int(slots_per_day) + 1):
         # Insert separator *after* slot i if boundary i exists.
         columns.append(f"Slot {i}")
         col_map.append(i)
         if i in boundaries:
-            columns.append("|")
+            # Streamlit uses pyarrow under the hood, which rejects duplicate column names.
+            # Keep a plain "|" for the first separator (existing behavior), and make
+            # subsequent separators unique.
+            sep_count += 1
+            columns.append("|" if sep_count == 1 else f"|{sep_count}")
             col_map.append(None)
 
     out_rows: list[list[str]] = []
